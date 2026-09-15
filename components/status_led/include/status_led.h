@@ -12,3 +12,4 @@ typedef enum {
 
 void status_led_init(void);
 void status_led_set(system_status_t status);
+void status_led_off(void);

@@ -42,6 +42,42 @@ static volatile bool mqtt_ok = false;
 static uint64_t sleep_seconds = DEFAULT_SLEEP_SECONDS;
 static bool ads1115_ready = false;
 
+static void publish_json_float(const char *topic, const char *sensor,
+                              const char *unit, const char *fmt, float value)
+{
+    char value_buffer[32];
+    int value_len = snprintf(value_buffer, sizeof(value_buffer), fmt, (double)value);
+    if (value_len < 0 || (size_t)value_len >= sizeof(value_buffer)) {
+        ESP_LOGW(TAG, "Payload JSON troppo lungo per %s", sensor);
+        return;
+    }
+
+    char payload[128];
+    int payload_len = snprintf(payload, sizeof(payload),
+                              "{\"sensor\":\"%s\",\"value\":%s,\"unit\":\"%s\"}",
+                              sensor, value_buffer, unit);
+    if (payload_len < 0 || (size_t)payload_len >= sizeof(payload)) {
+        ESP_LOGW(TAG, "JSON per %s troppo grande", sensor);
+        return;
+    }
+
+    mqtt_manager_publish(topic, payload, 1, false);
+}
+
+static void publish_json_status(const char *status)
+{
+    char payload[128];
+    int payload_len = snprintf(payload, sizeof(payload),
+                              "{\"device\":\"esp32-s3-mini\",\"status\":\"%s\"}",
+                              status);
+    if (payload_len < 0 || (size_t)payload_len >= sizeof(payload)) {
+        ESP_LOGW(TAG, "JSON per lo stato troppo grande");
+        return;
+    }
+
+    mqtt_manager_publish("esp32/test/status", payload, 1, true);
+}
+
 static esp_err_t ads1115_write_register(uint8_t reg, uint16_t value)
 {
     uint8_t data[] = {
@@ -91,7 +127,17 @@ static esp_err_t ads1115_init(void)
     }
     return err;
 }
-
+static esp_err_t ads1115_wait_conversion(void)
+{
+    uint16_t cfg;
+    for (int i = 0; i < 20; i++) {
+        esp_err_t err = ads1115_read_register(0x01, &cfg);
+        if (err != ESP_OK) return err;
+        if (cfg & 0x8000U) return ESP_OK; // OS=1 -> pronto
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return ESP_ERR_TIMEOUT;
+}
 static esp_err_t ads1115_read_channel(uint8_t channel, float *voltage)
 {
     if (channel > 3) {
@@ -106,7 +152,7 @@ static esp_err_t ads1115_read_channel(uint8_t channel, float *voltage)
         return err;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    ads1115_wait_conversion();
 
     uint16_t raw_register;
     err = ads1115_read_register(0x00, &raw_register);
@@ -168,35 +214,25 @@ static void ads1115_task(void *arg)
             float voltage;
             esp_err_t err = ads1115_read_channel(0, &voltage);
             if (err == ESP_OK) {
-                char voltage_payload[24];
-                snprintf(voltage_payload, sizeof(voltage_payload), "%.4f",
-                         (double)voltage);
-                mqtt_manager_publish(ADS1115_TOPIC, voltage_payload, 1, false);
+                publish_json_float(ADS1115_TOPIC, "ain0_voltage", "V", "%.4f", voltage);
 
                 if (voltage >= 0.0f && voltage < VCC_VOLTS) {
                     float r_incognita = R_NOTA_OHM * voltage /
                                         (VCC_VOLTS - voltage);
-                    char resistance_payload[24];
-                    snprintf(resistance_payload, sizeof(resistance_payload),
-                             "%.2f", (double)r_incognita);
-                    mqtt_manager_publish(ADS1115_RESISTANCE_TOPIC,
-                                         resistance_payload, 1, false);
+                    publish_json_float(ADS1115_RESISTANCE_TOPIC, "pt1000_resistance",
+                                       "ohm", "%.2f", r_incognita);
 
                     float temperature;
                     if (pt1000_resistance_to_temperature(r_incognita,
                                                           &temperature)) {
-                        char temperature_payload[24];
-                        snprintf(temperature_payload,
-                                 sizeof(temperature_payload), "%.2f",
+                        publish_json_float(PT1000_TEMPERATURE_TOPIC, "pt1000_temperature",
+                                           "C", "%.2f", temperature);
+                        ESP_LOGI(TAG, "ADS1115 AIN0: %.4f V, R: %.2f ohm, T: %.2f C",
+                                 (double)voltage, (double)r_incognita,
                                  (double)temperature);
-                        mqtt_manager_publish(PT1000_TEMPERATURE_TOPIC,
-                                             temperature_payload, 1, false);
-                        ESP_LOGI(TAG, "ADS1115 AIN0: %s V, R: %s ohm, T: %s C",
-                                 voltage_payload, resistance_payload,
-                                 temperature_payload);
                     } else {
-                        ESP_LOGW(TAG, "Resistenza PT1000 fuori intervallo: %s ohm",
-                                 resistance_payload);
+                        ESP_LOGW(TAG, "Resistenza PT1000 fuori intervallo: %.2f ohm",
+                                 (double)r_incognita);
                     }
                 } else {
                     ESP_LOGW(TAG, "Tensione ADS1115 non valida per il calcolo: %.4f V",
@@ -210,11 +246,9 @@ static void ads1115_task(void *arg)
             float ain1_voltage;
             err = ads1115_read_channel(1, &ain1_voltage);
             if (err == ESP_OK) {
-                char ain1_payload[24];
-                snprintf(ain1_payload, sizeof(ain1_payload), "%.4f",
-                         (double)ain1_voltage);
-                mqtt_manager_publish(ADS1115_AIN1_TOPIC, ain1_payload, 1, false);
-                ESP_LOGI(TAG, "ADS1115 AIN1: %s V", ain1_payload);
+                publish_json_float(ADS1115_AIN1_TOPIC, "ain1_voltage", "V", "%.4f",
+                                   ain1_voltage);
+                ESP_LOGI(TAG, "ADS1115 AIN1: %.4f V", (double)ain1_voltage);
             } else {
                 ESP_LOGW(TAG, "Lettura ADS1115 AIN1 fallita: %s",
                          esp_err_to_name(err));
@@ -248,7 +282,7 @@ static bool mqtt_started = false;
 static void publish_mqtt_status(void)
 {
     if (mqtt_ok) {
-        mqtt_manager_publish("esp32/test/status", "online", 1, true);
+        publish_json_status("online");
     }
 }
 
@@ -375,7 +409,7 @@ void app_main(void)
 
     wifi_manager_init(on_wifi_status);
     wifi_manager_set_credentials(0, "OSPITI2.4G", "ospiti-CONMAR");
-    wifi_manager_set_credentials(1, "SSID_SECONDARIA", "password_secondaria");
+    wifi_manager_set_credentials(1, "MachPower2.4", "12345678");
     wifi_manager_start();
 
     // Configurazione MQTT (solo al primo avvio, poi resta in NVS)
